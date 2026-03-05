@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import gc
 import inspect
 import json
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -27,21 +27,7 @@ class VisualizeRequest(BaseModel):
     batch_size: int = Field(default=1, ge=1, le=8)
     seq_len: int = Field(default=16, ge=1, le=512)
     trust_remote_code: bool = Field(default=False)
-    device: str = Field(default="cpu", description="cpu or cuda")
-
-
-@dataclass
-class NodeStats:
-    name: str
-    module_type: str
-    depth: int
-    order: int
-    call_count: int
-    input_shapes: set[str]
-    output_shapes: set[str]
-    parameter_shapes: list[dict[str, Any]]
-    parameter_count: int
-
+    device: str = Field(default="cpu", description="cpu, cuda, or cuda:<index>")
 
 def iter_tensors(value: Any):
     if isinstance(value, torch.Tensor):
@@ -87,6 +73,41 @@ def filter_for_forward(
         return candidate_inputs
     valid = set(signature.parameters.keys())
     return {key: value for key, value in candidate_inputs.items() if key in valid}
+
+
+def normalize_device(device_value: str) -> tuple[torch.device, str]:
+    normalized = device_value.lower().strip()
+    if normalized == "cpu":
+        return torch.device("cpu"), "cpu"
+
+    if normalized == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA requested but not available")
+        index = torch.cuda.current_device()
+        return torch.device(f"cuda:{index}"), f"cuda:{index}"
+
+    if normalized.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA requested but not available")
+        suffix = normalized.split(":", 1)[1]
+        if not suffix.isdigit():
+            raise ValueError("CUDA device must look like cuda:<index>")
+        index = int(suffix)
+        count = torch.cuda.device_count()
+        if index < 0 or index >= count:
+            raise ValueError(
+                f"CUDA device index {index} is out of range. Available devices: 0..{count - 1}"
+            )
+        return torch.device(f"cuda:{index}"), f"cuda:{index}"
+
+    raise ValueError("device must be 'cpu', 'cuda', or 'cuda:<index>'")
+
+
+def release_gpu_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def build_fallback_inputs(
@@ -230,20 +251,20 @@ def trace_model_execution(
         sum(param.numel() for param in model.parameters() if param.requires_grad)
     )
 
-    stats: dict[str, NodeStats] = {}
-    order_counter = 0
-    edge_shapes: dict[tuple[str, str], set[str]] = {}
-    all_produced_ids: set[int] = set()
-    consumed_ids: set[int] = set()
+    edge_shapes: dict[tuple[str, str, str], set[str]] = {}
+    module_nodes: list[dict[str, Any]] = []
+    module_call_count: dict[str, int] = {}
+    functional_node_used = False
     tensor_producer: dict[int, str] = {}
     tensor_shape: dict[int, str] = {}
+    input_tensor_ids = {id(tensor) for tensor in iter_tensors(inputs)}
     hooks = []
 
     for tensor in iter_tensors(inputs):
         tensor_shape[id(tensor)] = format_shape(list(tensor.shape))
 
-    def add_edge(source: str, target: str, shape: str):
-        key = (source, target)
+    def add_edge(source: str, target: str, shape: str, kind: str):
+        key = (source, target, kind)
         if key not in edge_shapes:
             edge_shapes[key] = set()
         edge_shapes[key].add(shape)
@@ -273,44 +294,52 @@ def trace_model_execution(
             direct_parameter_shapes: list[dict[str, Any]] = direct_params,
             direct_parameter_count: int = param_count,
         ):
-            nonlocal order_counter
+            nonlocal functional_node_used
 
-            if module_name not in stats:
-                stats[module_name] = NodeStats(
-                    name=module_name,
-                    module_type=module_type,
-                    depth=module_name.count("."),
-                    order=order_counter,
-                    call_count=0,
-                    input_shapes=set(),
-                    output_shapes=set(),
-                    parameter_shapes=direct_parameter_shapes,
-                    parameter_count=direct_parameter_count,
-                )
-                order_counter += 1
+            current_call = module_call_count.get(module_name, 0) + 1
+            module_call_count[module_name] = current_call
+            call_node_id = f"{module_name}#{current_call}"
 
-            node = stats[module_name]
-            node.call_count += 1
-            node.input_shapes.add(format_shape(shape_of({"args": args, "kwargs": kwargs})))
-            node.output_shapes.add(format_shape(shape_of(output)))
+            module_nodes.append(
+                {
+                    "id": call_node_id,
+                    "label": f"{module_name}#{current_call}\n({module_type})",
+                    "module_name": module_name,
+                    "call_index": current_call,
+                    "module_type": module_type,
+                    "depth": module_name.count(".") + 1,
+                    "call_count": 1,
+                    "input_shapes": [format_shape(shape_of({"args": args, "kwargs": kwargs}))],
+                    "output_shapes": [format_shape(shape_of(output))],
+                    "parameter_count": direct_parameter_count,
+                    "parameter_shapes": direct_parameter_shapes,
+                }
+            )
 
             input_ids = collect_tensor_ids((args, kwargs))
             for tensor_id in input_ids:
                 shape_repr = tensor_shape.get(tensor_id, "unknown")
                 source = tensor_producer.get(tensor_id)
                 if source is None:
-                    add_edge("__input__", module_name, shape_repr)
+                    if tensor_id in input_tensor_ids:
+                        add_edge("__input__", call_node_id, shape_repr, "input")
+                    else:
+                        functional_node_used = True
+                        add_edge(
+                            "__functional__",
+                            call_node_id,
+                            shape_repr,
+                            "functional_inferred",
+                        )
                 else:
-                    consumed_ids.add(tensor_id)
-                    if source != module_name:
-                        add_edge(source, module_name, shape_repr)
+                    if source != call_node_id:
+                        add_edge(source, call_node_id, shape_repr, "observed")
 
             for tensor in iter_tensors(output):
                 tid = id(tensor)
                 shape_repr = format_shape(list(tensor.shape))
-                tensor_producer[tid] = module_name
+                tensor_producer[tid] = call_node_id
                 tensor_shape[tid] = shape_repr
-                all_produced_ids.add(tid)
 
         try:
             hooks.append(module.register_forward_hook(hook_fn, with_kwargs=True))
@@ -327,16 +356,25 @@ def trace_model_execution(
 
             hooks.append(module.register_forward_hook(compat_hook))
 
-    with torch.no_grad():
-        _ = model(**inputs)
+    try:
+        with torch.no_grad():
+            model_output = model(**inputs)
+    finally:
+        for hook in hooks:
+            hook.remove()
 
-    for hook in hooks:
-        hook.remove()
-
-    terminal_ids = all_produced_ids - consumed_ids
-    terminal_modules = {tensor_producer[tid] for tid in terminal_ids if tid in tensor_producer}
-    for module_name in terminal_modules:
-        add_edge(module_name, "__output__", "terminal")
+    output_tensor_ids = set(collect_tensor_ids(model_output))
+    for tensor_id in output_tensor_ids:
+        shape_repr = tensor_shape.get(tensor_id, "unknown")
+        source = tensor_producer.get(tensor_id)
+        if source is not None:
+            add_edge(source, "__output__", shape_repr, "terminal")
+            continue
+        if tensor_id in input_tensor_ids:
+            add_edge("__input__", "__output__", shape_repr, "terminal")
+            continue
+        functional_node_used = True
+        add_edge("__functional__", "__output__", shape_repr, "terminal")
 
     nodes: list[dict[str, Any]] = [
         {
@@ -352,20 +390,22 @@ def trace_model_execution(
         }
     ]
 
-    for node in sorted(stats.values(), key=lambda item: item.order):
+    if functional_node_used:
         nodes.append(
             {
-                "id": node.name,
-                "label": f"{node.name}\n({node.module_type})",
-                "module_type": node.module_type,
-                "depth": node.depth + 1,
-                "call_count": node.call_count,
-                "input_shapes": sorted(node.input_shapes),
-                "output_shapes": sorted(node.output_shapes),
-                "parameter_count": node.parameter_count,
-                "parameter_shapes": node.parameter_shapes,
+                "id": "__functional__",
+                "label": "Functional / Uncaptured Ops",
+                "module_type": "Functional",
+                "depth": 0,
+                "call_count": 1,
+                "input_shapes": [],
+                "output_shapes": [],
+                "parameter_count": 0,
+                "parameter_shapes": [],
             }
         )
+
+    nodes.extend(module_nodes)
 
     nodes.append(
         {
@@ -382,11 +422,12 @@ def trace_model_execution(
     )
 
     edges: list[dict[str, Any]] = []
-    for (source, target), shapes in sorted(edge_shapes.items()):
+    for (source, target, kind), shapes in sorted(edge_shapes.items()):
         edges.append(
             {
                 "source": source,
                 "target": target,
+                "kind": kind,
                 "shapes": sorted(shapes),
                 "count": len(shapes),
             }
@@ -396,7 +437,8 @@ def trace_model_execution(
         "nodes": nodes,
         "edges": edges,
         "totals": {
-            "executed_modules": len(stats),
+            "executed_modules": len({node["module_name"] for node in module_nodes}),
+            "executed_calls": len(module_nodes),
             "parameters": total_parameters,
             "trainable_parameters": trainable_parameters,
         },
@@ -426,51 +468,75 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/api/release-gpu")
+def release_gpu():
+    release_gpu_memory()
+    return {"status": "released"}
+
+
 @app.post("/api/visualize")
 def visualize(request: VisualizeRequest):
-    device = request.device.lower().strip()
-    if device not in {"cpu", "cuda"}:
-        raise HTTPException(status_code=400, detail="device must be 'cpu' or 'cuda'")
-    if device == "cuda" and not torch.cuda.is_available():
-        raise HTTPException(status_code=400, detail="CUDA requested but not available")
+    model = None
+    inputs: dict[str, torch.Tensor] = {}
+    device_obj = torch.device("cpu")
+    warnings: list[str] = []
+    graph: dict[str, Any] | None = None
+    normalized_device = "cpu"
 
     try:
-        model = AutoModel.from_pretrained(
-            request.model_id_or_path,
-            trust_remote_code=request.trust_remote_code,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Failed to load model '{request.model_id_or_path}'. "
-                "If this model requires custom code, enable trust_remote_code. "
-                f"Original error: {exc}"
-            ),
-        ) from exc
+        try:
+            device_obj, normalized_device = normalize_device(request.device)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    model.to(device)
-    signature = inspect.signature(model.forward)
+        try:
+            model = AutoModel.from_pretrained(
+                request.model_id_or_path,
+                trust_remote_code=request.trust_remote_code,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Failed to load model '{request.model_id_or_path}'. "
+                    "If this model requires custom code, enable trust_remote_code. "
+                    f"Original error: {exc}"
+                ),
+            ) from exc
 
-    try:
-        inputs, warnings = build_inputs(model, request, signature)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to build inputs: {exc}") from exc
+        model.to(device_obj)
+        signature = inspect.signature(model.forward)
 
-    inputs = {key: value.to(device) for key, value in inputs.items()}
+        try:
+            inputs, warnings = build_inputs(model, request, signature)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Failed to build inputs: {exc}"
+            ) from exc
 
-    try:
-        graph = trace_model_execution(model=model, inputs=inputs)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Model trace failed: {exc}") from exc
+        inputs = {key: value.to(device_obj) for key, value in inputs.items()}
 
-    return {
-        "model": {
-            "id_or_path": request.model_id_or_path,
-            "class": model.__class__.__name__,
-            "device": device,
-        },
-        "input_shapes": {key: list(value.shape) for key, value in inputs.items()},
-        "warnings": warnings,
-        **graph,
-    }
+        try:
+            graph = trace_model_execution(model=model, inputs=inputs)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Model trace failed: {exc}") from exc
+
+        return {
+            "model": {
+                "id_or_path": request.model_id_or_path,
+                "class": model.__class__.__name__,
+                "device": normalized_device,
+            },
+            "input_shapes": {key: list(value.shape) for key, value in inputs.items()},
+            "warnings": warnings,
+            **graph,
+        }
+    finally:
+        if graph is not None:
+            del graph
+        if inputs:
+            del inputs
+        if model is not None:
+            del model
+        if device_obj.type == "cuda":
+            release_gpu_memory()
