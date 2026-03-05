@@ -60,14 +60,14 @@
 
             <label>
               Device
-              <select id="device" name="device">
-                <option value="cpu" selected>cpu</option>
-                <option value="cuda">cuda</option>
-              </select>
+              <input id="device" name="device" value="cpu" placeholder="cpu / cuda / cuda:0" />
             </label>
           </div>
 
           <button id="run-button" type="submit">Visualize</button>
+          <button id="release-gpu-button" type="button" class="secondary-btn">
+            Release GPU memory
+          </button>
         </form>
       </section>
 
@@ -78,6 +78,12 @@
 
       <section class="panel graph-panel">
         <h2>Architecture Graph</h2>
+        <div class="legend">
+          <span><i class="swatch input"></i>Input edge</span>
+          <span><i class="swatch observed"></i>Observed module edge</span>
+          <span><i class="swatch functional"></i>Functional/inferred edge</span>
+          <span><i class="swatch terminal"></i>Output edge</span>
+        </div>
         <div id="graph"></div>
       </section>
 

@@ -12,9 +12,10 @@ The app traces execution by running one forward pass with auto-generated sample 
 ## Features
 
 - **Backend**: FastAPI endpoint that loads a model and traces executed leaf modules.
-- **Graph extraction**: tensor provenance tracking to build directed data-flow edges.
+- **Graph extraction**: tensor provenance tracking to build directed data-flow edges per module invocation.
 - **Frontend**: browser UI with an interactive architecture graph and layer detail panel.
 - **Simple deployment**: one Python service that serves both API and static web page.
+- **Device targeting**: supports `cpu`, `cuda`, and `cuda:<index>` (e.g. `cuda:0`, `cuda:1`).
 
 ## Quick start
 
@@ -49,20 +50,27 @@ Request example:
   "batch_size": 1,
   "seq_len": 16,
   "trust_remote_code": false,
-  "device": "cpu"
+  "device": "cuda:0"
 }
 ```
 
 Response contains:
 
-- `nodes`: modules (plus Input/Output pseudo nodes),
-- `edges`: observed data flow edges,
+- `nodes`: module-invocation nodes (plus Input/Output/Functional pseudo nodes),
+- `edges`: observed and inferred data flow edges (`input`, `observed`, `functional_inferred`, `terminal`),
 - `input_shapes`, `warnings`,
+- `totals.executed_modules`, `totals.executed_calls`,
 - `totals.parameters`, `totals.trainable_parameters`.
+
+### `POST /api/release-gpu`
+
+Best-effort GPU cache cleanup (`gc.collect()`, `torch.cuda.empty_cache()`, `torch.cuda.ipc_collect()`).
+The UI also calls this automatically when you press **Release GPU memory** or close the tab.
 
 ## Notes and limitations
 
 - The graph reflects execution for the **provided sample input**, which is usually what you want for "real" flow.
 - This MVP traces **leaf modules** (e.g., Linear, LayerNorm, Attention internals implemented as modules). Pure functional ops not wrapped in modules may not appear as separate nodes.
+- When a tensor arrives from non-leaf/functional code, the graph routes it through a `Functional / Uncaptured Ops` pseudo node instead of incorrectly showing it as a direct model input edge.
 - Input generation is automatic (tokenizer first, then random fallback). Some highly custom models may require extending input builders.
 - `trust_remote_code=true` can execute remote model code; only enable in trusted environments.
