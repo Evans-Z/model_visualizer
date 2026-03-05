@@ -73,6 +73,14 @@
             </select>
           </label>
 
+          <label>
+            Operation detail
+            <select id="operation-detail" name="operation_detail">
+              <option value="key" selected>key operations only (recommended)</option>
+              <option value="full">full operation graph</option>
+            </select>
+          </label>
+
           <button id="run-button" type="submit">Visualize</button>
           <button id="release-gpu-button" type="button" class="secondary-btn">
             Release GPU memory
@@ -90,6 +98,7 @@
         <div class="legend">
           <span><i class="swatch input"></i>Input edge</span>
           <span><i class="swatch observed"></i>Observed module edge</span>
+          <span><i class="swatch key"></i>Key-flow compressed edge</span>
           <span><i class="swatch functional"></i>Functional/inferred edge</span>
           <span><i class="swatch terminal"></i>Output edge</span>
         </div>

@@ -232,6 +232,14 @@ function renderGraph(payload) {
           "target-arrow-color": "#22c55e",
         },
       },
+      {
+        selector: "edge.compressed_key",
+        style: {
+          "line-color": "#fbbf24",
+          "target-arrow-color": "#fbbf24",
+          "line-style": "dashed",
+        },
+      },
     ],
     layout: { name: "preset", positions, animate: false },
     minZoom: 0.1,
@@ -273,6 +281,7 @@ form.addEventListener("submit", async (event) => {
     trust_remote_code: document.getElementById("trust-remote-code").checked,
     device: document.getElementById("device").value.trim(),
     graph_mode: document.getElementById("graph-mode").value,
+    operation_detail: document.getElementById("operation-detail").value,
   };
 
   try {
@@ -295,6 +304,8 @@ form.addEventListener("submit", async (event) => {
         `Device: ${result.model.device}`,
         `Graph mode requested: ${result.graph_mode_requested}`,
         `Graph mode used: ${result.graph_mode_used}`,
+        `Operation detail requested: ${result.operation_detail_requested}`,
+        `Operation detail used: ${result.operation_detail_used}`,
         `Executed unique modules: ${result.totals.executed_modules.toLocaleString()}`,
         `Executed calls: ${result.totals.executed_calls.toLocaleString()}`,
         `Total params: ${result.totals.parameters.toLocaleString()}`,
