@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hugging Face Model Visualizer</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="https://unpkg.com/cytoscape@3.29.2/dist/cytoscape.min.js"></script>
+    <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+    <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Hugging Face Model Visualizer</h1>
+      <p>
+        Trace real forward execution and inspect data flow, activation shapes, and
+        parameter dimensions.
+      </p>
+    </header>
+
+    <main>
+      <section class="panel controls">
+        <form id="visualize-form">
+          <label>
+            Model ID or local path
+            <input
+              id="model-id"
+              name="model_id_or_path"
+              value="distilbert-base-uncased"
+              required
+            />
+          </label>
+
+          <label>
+            Sample text
+            <input
+              id="sample-text"
+              name="sample_text"
+              value="Hello architecture visualizer"
+              required
+            />
+          </label>
+
+          <div class="row">
+            <label>
+              Sequence length
+              <input id="seq-len" name="seq_len" type="number" min="1" max="512" value="16" />
+            </label>
+            <label>
+              Batch size
+              <input id="batch-size" name="batch_size" type="number" min="1" max="8" value="1" />
+            </label>
+          </div>
+
+          <div class="row">
+            <label class="checkbox">
+              <input id="trust-remote-code" name="trust_remote_code" type="checkbox" />
+              trust_remote_code
+            </label>
+
+            <label>
+              Device
+              <select id="device" name="device">
+                <option value="cpu" selected>cpu</option>
+                <option value="cuda">cuda</option>
+              </select>
+            </label>
+          </div>
+
+          <button id="run-button" type="submit">Visualize</button>
+        </form>
+      </section>
+
+      <section class="panel status">
+        <h2>Status</h2>
+        <pre id="status-output">Ready.</pre>
+      </section>
+
+      <section class="panel graph-panel">
+        <h2>Architecture Graph</h2>
+        <div id="graph"></div>
+      </section>
+
+      <section class="panel detail-panel">
+        <h2>Node Details</h2>
+        <div id="node-details">Click a node to inspect layer dimensions.</div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
