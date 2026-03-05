@@ -21,6 +21,11 @@ try:  # pragma: no cover - depends on transformers version
 except Exception:  # pragma: no cover - optional fallback
     hf_symbolic_trace = None
 
+try:  # pragma: no cover - depends on torch version
+    from torch.fx.experimental.proxy_tensor import make_fx
+except Exception:  # pragma: no cover - optional fallback
+    make_fx = None
+
 
 class VisualizeRequest(BaseModel):
     model_id_or_path: str = Field(
@@ -170,12 +175,14 @@ def split_inputs_for_signature(
 def build_fx_graph_with_retries(
     model: torch.nn.Module,
     input_names: list[str],
-) -> tuple[GraphModule, list[str]]:
+    args: list[torch.Tensor],
+    kwargs: dict[str, torch.Tensor],
+) -> tuple[GraphModule, list[str], str, list[torch.Tensor]]:
     warnings: list[str] = []
     errors: list[str] = []
 
     try:
-        return symbolic_trace(model), warnings
+        return symbolic_trace(model), warnings, "symbolic", []
     except Exception as exc:
         errors.append(f"default symbolic_trace failed: {exc}")
 
@@ -186,7 +193,7 @@ def build_fx_graph_with_retries(
                 input_names=input_names,
             )
             warnings.append("Using transformers.fx symbolic trace compatibility mode.")
-            return traced, warnings
+            return traced, warnings, "hf_symbolic", []
         except Exception as exc:
             errors.append(f"transformers.fx symbolic_trace failed: {exc}")
 
@@ -198,9 +205,30 @@ def build_fx_graph_with_retries(
         )
         graph = tracer.trace(model)
         warnings.append("Using fallback FX tracer with autowrapped builtins.")
-        return GraphModule(model, graph), warnings
+        return GraphModule(model, graph), warnings, "fallback_tracer", []
     except Exception as exc:
         errors.append(f"fallback tracer failed: {exc}")
+
+    # Final fallback: runtime operator tracing via make_fx.
+    if make_fx is not None:
+        try:
+            pos_count = len(args)
+            kwarg_names = list(kwargs.keys())
+            flat_inputs = [*args, *[kwargs[name] for name in kwarg_names]]
+
+            def forward_for_make_fx(*flat_args):
+                call_args = flat_args[:pos_count]
+                kwarg_values = flat_args[pos_count:]
+                call_kwargs = {
+                    name: kwarg_values[index] for index, name in enumerate(kwarg_names)
+                }
+                return model(*call_args, **call_kwargs)
+
+            traced = make_fx(forward_for_make_fx, tracing_mode="real")(*flat_inputs)
+            warnings.append("Using make_fx runtime operator tracing fallback.")
+            return traced, warnings, "make_fx", flat_inputs
+        except Exception as exc:
+            errors.append(f"make_fx runtime tracing failed: {exc}")
 
     raise RuntimeError(" | ".join(errors))
 
@@ -559,12 +587,19 @@ def trace_operations_execution(
     signature: inspect.Signature,
 ) -> tuple[dict[str, Any], list[str]]:
     warnings: list[str] = []
-    traced, trace_warnings = build_fx_graph_with_retries(model, list(inputs.keys()))
-    warnings.extend(trace_warnings)
-
     args, kwargs = split_inputs_for_signature(signature, inputs)
+    traced, trace_warnings, trace_kind, flat_inputs = build_fx_graph_with_retries(
+        model,
+        list(inputs.keys()),
+        args,
+        kwargs,
+    )
+    warnings.extend(trace_warnings)
     try:
-        ShapeProp(traced).propagate(*args, **kwargs)
+        if trace_kind == "make_fx":
+            ShapeProp(traced).propagate(*flat_inputs)
+        else:
+            ShapeProp(traced).propagate(*args, **kwargs)
     except Exception as exc:
         warnings.append(f"Shape propagation unavailable for operation graph: {exc}")
 
@@ -603,12 +638,15 @@ def trace_operations_execution(
     output_sources: list[str] = []
     executed_module_names: set[str] = set()
     sequence_order = 0
+    placeholder_index = 0
 
     for fx_node in traced.graph.nodes:
         if fx_node.op == "placeholder":
             node_id = f"fx:input:{fx_node.name}"
             node_id_by_name[fx_node.name] = node_id
             input_tensor = inputs.get(fx_node.name)
+            if input_tensor is None and placeholder_index < len(flat_inputs):
+                input_tensor = flat_inputs[placeholder_index]
             output_shape = (
                 format_shape(list(input_tensor.shape))
                 if input_tensor is not None
@@ -634,6 +672,7 @@ def trace_operations_execution(
             )
             add_edge("__input__", node_id, output_shape, "input")
             sequence_order += 1
+            placeholder_index += 1
             continue
 
         if fx_node.op == "output":

@@ -72,8 +72,9 @@ Response contains:
 - `hybrid`: try operation graph first, fallback to module graph.
 
 In `hybrid` mode the backend retries operation tracing with multiple strategies
-(default FX, `transformers.utils.fx` compatibility tracer, then a fallback tracer
-with autowrapped Python builtins such as `len`/`range`) before falling back.
+(default FX, `transformers.utils.fx` compatibility tracer, a fallback tracer with
+autowrapped Python builtins such as `len`/`range`, and runtime operator tracing
+via `make_fx`) before falling back.
 
 ### `POST /api/release-gpu`
 
