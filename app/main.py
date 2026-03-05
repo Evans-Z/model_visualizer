@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import inspect
 import json
+import re
 from typing import Any
 
 import torch
@@ -11,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from torch.fx import symbolic_trace
+from torch.fx.passes.shape_prop import ShapeProp
 from transformers import AutoModel, AutoTokenizer
 
 
@@ -28,6 +31,10 @@ class VisualizeRequest(BaseModel):
     seq_len: int = Field(default=16, ge=1, le=512)
     trust_remote_code: bool = Field(default=False)
     device: str = Field(default="cpu", description="cpu, cuda, or cuda:<index>")
+    graph_mode: str = Field(
+        default="hybrid",
+        description="module, operations, or hybrid (prefer operations fallback to module)",
+    )
 
 def iter_tensors(value: Any):
     if isinstance(value, torch.Tensor):
@@ -108,6 +115,51 @@ def release_gpu_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+
+
+def infer_stage_index(name: str, sequence_order: int) -> int:
+    patterns = [
+        r"(?:^|\.)(?:layers?|blocks?|h)\.(\d+)(?:\.|$)",
+        r"(?:^|\.)(?:encoder|decoder)\.layer\.(\d+)(?:\.|$)",
+        r"(?:^|\.)(?:encoder|decoder)\.block\.(\d+)(?:\.|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, name)
+        if match:
+            return int(match.group(1))
+    # Keep non-layered nodes deterministic but after indexed layers.
+    return 10_000 + sequence_order
+
+
+def node_shape_from_fx_meta(meta: Any) -> str:
+    if meta is None:
+        return "unknown"
+    if isinstance(meta, (list, tuple)):
+        return format_shape([node_shape_from_fx_meta(item) for item in meta])
+    if hasattr(meta, "shape"):
+        try:
+            return format_shape(list(meta.shape))
+        except Exception:
+            return str(meta)
+    return str(meta)
+
+
+def split_inputs_for_signature(
+    signature: inspect.Signature, inputs: dict[str, torch.Tensor]
+) -> tuple[list[torch.Tensor], dict[str, torch.Tensor]]:
+    args: list[torch.Tensor] = []
+    kwargs: dict[str, torch.Tensor] = {}
+    for name, param in signature.parameters.items():
+        if name == "self" or name not in inputs:
+            continue
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            args.append(inputs[name])
+        else:
+            kwargs[name] = inputs[name]
+    return args, kwargs
 
 
 def build_fallback_inputs(
@@ -255,6 +307,7 @@ def trace_model_execution(
     module_nodes: list[dict[str, Any]] = []
     module_call_count: dict[str, int] = {}
     functional_node_used = False
+    sequence_order = 0
     tensor_producer: dict[int, str] = {}
     tensor_shape: dict[int, str] = {}
     input_tensor_ids = {id(tensor) for tensor in iter_tensors(inputs)}
@@ -295,20 +348,26 @@ def trace_model_execution(
             direct_parameter_count: int = param_count,
         ):
             nonlocal functional_node_used
+            nonlocal sequence_order
 
             current_call = module_call_count.get(module_name, 0) + 1
             module_call_count[module_name] = current_call
             call_node_id = f"{module_name}#{current_call}"
+            node_order = sequence_order
+            sequence_order += 1
 
             module_nodes.append(
                 {
                     "id": call_node_id,
                     "label": f"{module_name}#{current_call}\n({module_type})",
                     "module_name": module_name,
+                    "op_target": module_name,
                     "call_index": current_call,
                     "module_type": module_type,
                     "depth": module_name.count(".") + 1,
                     "call_count": 1,
+                    "sequence_order": node_order,
+                    "stage_index": infer_stage_index(module_name, node_order),
                     "input_shapes": [format_shape(shape_of({"args": args, "kwargs": kwargs}))],
                     "output_shapes": [format_shape(shape_of(output))],
                     "parameter_count": direct_parameter_count,
@@ -383,6 +442,8 @@ def trace_model_execution(
             "module_type": "Input",
             "depth": 0,
             "call_count": 1,
+            "sequence_order": -2,
+            "stage_index": -2,
             "input_shapes": [],
             "output_shapes": [format_shape(shape_of(inputs))],
             "parameter_count": 0,
@@ -398,6 +459,8 @@ def trace_model_execution(
                 "module_type": "Functional",
                 "depth": 0,
                 "call_count": 1,
+                "sequence_order": -1,
+                "stage_index": -1,
                 "input_shapes": [],
                 "output_shapes": [],
                 "parameter_count": 0,
@@ -414,6 +477,8 @@ def trace_model_execution(
             "module_type": "Output",
             "depth": 0,
             "call_count": 1,
+            "sequence_order": sequence_order + 1,
+            "stage_index": infer_stage_index("output", sequence_order + 1),
             "input_shapes": [],
             "output_shapes": [],
             "parameter_count": 0,
@@ -443,6 +508,207 @@ def trace_model_execution(
             "trainable_parameters": trainable_parameters,
         },
     }
+
+
+def trace_operations_execution(
+    model: torch.nn.Module,
+    inputs: dict[str, torch.Tensor],
+    signature: inspect.Signature,
+) -> tuple[dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    traced = symbolic_trace(model)
+
+    args, kwargs = split_inputs_for_signature(signature, inputs)
+    try:
+        ShapeProp(traced).propagate(*args, **kwargs)
+    except Exception as exc:
+        warnings.append(f"Shape propagation unavailable for operation graph: {exc}")
+
+    total_parameters = int(sum(param.numel() for param in model.parameters()))
+    trainable_parameters = int(
+        sum(param.numel() for param in model.parameters() if param.requires_grad)
+    )
+
+    nodes: list[dict[str, Any]] = [
+        {
+            "id": "__input__",
+            "label": "Input",
+            "module_name": "__input__",
+            "op_target": "__input__",
+            "call_index": 1,
+            "module_type": "Input",
+            "depth": 0,
+            "call_count": 1,
+            "sequence_order": -2,
+            "stage_index": -2,
+            "input_shapes": [],
+            "output_shapes": [format_shape(shape_of(inputs))],
+            "parameter_count": 0,
+            "parameter_shapes": [],
+        }
+    ]
+    edges_map: dict[tuple[str, str, str], set[str]] = {}
+
+    def add_edge(source: str, target: str, shape: str, kind: str):
+        key = (source, target, kind)
+        if key not in edges_map:
+            edges_map[key] = set()
+        edges_map[key].add(shape)
+
+    node_id_by_name: dict[str, str] = {}
+    output_sources: list[str] = []
+    executed_module_names: set[str] = set()
+    sequence_order = 0
+
+    for fx_node in traced.graph.nodes:
+        if fx_node.op == "placeholder":
+            node_id = f"fx:input:{fx_node.name}"
+            node_id_by_name[fx_node.name] = node_id
+            input_tensor = inputs.get(fx_node.name)
+            output_shape = (
+                format_shape(list(input_tensor.shape))
+                if input_tensor is not None
+                else node_shape_from_fx_meta(fx_node.meta.get("tensor_meta"))
+            )
+            nodes.append(
+                {
+                    "id": node_id,
+                    "label": fx_node.name,
+                    "module_name": fx_node.name,
+                    "op_target": fx_node.name,
+                    "call_index": 1,
+                    "module_type": "InputArg",
+                    "depth": 1,
+                    "call_count": 1,
+                    "sequence_order": sequence_order,
+                    "stage_index": -1,
+                    "input_shapes": [],
+                    "output_shapes": [output_shape],
+                    "parameter_count": 0,
+                    "parameter_shapes": [],
+                }
+            )
+            add_edge("__input__", node_id, output_shape, "input")
+            sequence_order += 1
+            continue
+
+        if fx_node.op == "output":
+            output_sources = [node_id_by_name[src.name] for src in fx_node.all_input_nodes]
+            continue
+
+        node_id = f"fx:{fx_node.name}"
+        node_id_by_name[fx_node.name] = node_id
+
+        parameter_shapes: list[dict[str, Any]] = []
+        parameter_count = 0
+        module_type = fx_node.op
+        op_target = str(fx_node.target)
+        module_name = str(fx_node.target)
+
+        if fx_node.op == "call_module":
+            submodule = traced.get_submodule(str(fx_node.target))
+            module_type = submodule.__class__.__name__
+            module_name = str(fx_node.target)
+            op_target = module_name
+            executed_module_names.add(module_name)
+            for param_name, param in submodule.named_parameters(recurse=False):
+                parameter_shapes.append(
+                    {"name": param_name, "shape": list(param.shape), "numel": int(param.numel())}
+                )
+                parameter_count += int(param.numel())
+        elif fx_node.op == "call_function":
+            target_name = getattr(fx_node.target, "__name__", str(fx_node.target))
+            module_type = "FunctionOp"
+            op_target = target_name
+            module_name = fx_node.name
+        elif fx_node.op == "call_method":
+            module_type = "MethodOp"
+            op_target = str(fx_node.target)
+            module_name = fx_node.name
+        elif fx_node.op == "get_attr":
+            module_type = "GetAttr"
+            op_target = str(fx_node.target)
+            module_name = str(fx_node.target)
+
+        output_shape = node_shape_from_fx_meta(fx_node.meta.get("tensor_meta"))
+        nodes.append(
+            {
+                "id": node_id,
+                "label": f"{fx_node.name}\n({module_type})",
+                "module_name": module_name,
+                "op_target": op_target,
+                "call_index": 1,
+                "module_type": module_type,
+                "depth": module_name.count(".") + 1,
+                "call_count": 1,
+                "sequence_order": sequence_order,
+                "stage_index": infer_stage_index(module_name, sequence_order),
+                "input_shapes": [],
+                "output_shapes": [output_shape],
+                "parameter_count": parameter_count,
+                "parameter_shapes": parameter_shapes,
+            }
+        )
+
+        for source_node in fx_node.all_input_nodes:
+            source_id = node_id_by_name.get(source_node.name)
+            if source_id is None:
+                continue
+            src_shape = node_shape_from_fx_meta(source_node.meta.get("tensor_meta"))
+            add_edge(source_id, node_id, src_shape, "observed")
+
+        sequence_order += 1
+
+    max_stage = max((node.get("stage_index", 0) for node in nodes), default=0)
+    nodes.append(
+        {
+            "id": "__output__",
+            "label": "Output",
+            "module_name": "__output__",
+            "op_target": "__output__",
+            "call_index": 1,
+            "module_type": "Output",
+            "depth": 0,
+            "call_count": 1,
+            "sequence_order": sequence_order + 1,
+            "stage_index": max_stage + 1,
+            "input_shapes": [],
+            "output_shapes": [],
+            "parameter_count": 0,
+            "parameter_shapes": [],
+        }
+    )
+
+    node_ids = {node["id"] for node in nodes}
+    for source_id in output_sources:
+        if source_id in node_ids:
+            add_edge(source_id, "__output__", "terminal", "terminal")
+
+    edges: list[dict[str, Any]] = []
+    for (source, target, kind), shapes in sorted(edges_map.items()):
+        edges.append(
+            {
+                "source": source,
+                "target": target,
+                "kind": kind,
+                "shapes": sorted(shapes),
+                "count": len(shapes),
+            }
+        )
+
+    return (
+        {
+            "nodes": nodes,
+            "edges": edges,
+            "totals": {
+                "executed_modules": len(executed_module_names),
+                "executed_calls": max(len(nodes) - 2, 0),
+                "parameters": total_parameters,
+                "trainable_parameters": trainable_parameters,
+            },
+        },
+        warnings,
+    )
 
 
 app = FastAPI(title="Hugging Face Model Visualizer")
@@ -482,6 +748,7 @@ def visualize(request: VisualizeRequest):
     warnings: list[str] = []
     graph: dict[str, Any] | None = None
     normalized_device = "cpu"
+    graph_mode_used = "module"
 
     try:
         try:
@@ -516,10 +783,36 @@ def visualize(request: VisualizeRequest):
 
         inputs = {key: value.to(device_obj) for key, value in inputs.items()}
 
-        try:
-            graph = trace_model_execution(model=model, inputs=inputs)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Model trace failed: {exc}") from exc
+        graph_mode_requested = request.graph_mode.lower().strip()
+        if graph_mode_requested not in {"module", "operations", "hybrid"}:
+            raise HTTPException(
+                status_code=400,
+                detail="graph_mode must be 'module', 'operations', or 'hybrid'",
+            )
+
+        if graph_mode_requested in {"operations", "hybrid"}:
+            try:
+                graph, op_warnings = trace_operations_execution(
+                    model=model,
+                    inputs=inputs,
+                    signature=signature,
+                )
+                warnings.extend(op_warnings)
+                graph_mode_used = "operations"
+            except Exception as exc:
+                warnings.append(f"Operation-level graph failed; falling back to module graph. ({exc})")
+                if graph_mode_requested == "operations":
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Operation graph generation failed: {exc}",
+                    ) from exc
+
+        if graph is None:
+            try:
+                graph = trace_model_execution(model=model, inputs=inputs)
+                graph_mode_used = "module"
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Model trace failed: {exc}") from exc
 
         return {
             "model": {
@@ -527,6 +820,8 @@ def visualize(request: VisualizeRequest):
                 "class": model.__class__.__name__,
                 "device": normalized_device,
             },
+            "graph_mode_requested": graph_mode_requested,
+            "graph_mode_used": graph_mode_used,
             "input_shapes": {key: list(value.shape) for key, value in inputs.items()},
             "warnings": warnings,
             **graph,

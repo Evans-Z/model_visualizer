@@ -51,8 +51,11 @@ function buildElements(payload) {
         id: node.id,
         label: nodeDisplayLabel(node),
         module_name: node.module_name || node.id,
+        op_target: node.op_target || node.module_name || node.id,
         call_index: node.call_index || null,
         module_type: node.module_type,
+        sequence_order: Number.isFinite(node.sequence_order) ? node.sequence_order : 0,
+        stage_index: Number.isFinite(node.stage_index) ? node.stage_index : null,
         parameter_count: node.parameter_count,
         call_count: node.call_count,
         input_shapes: node.input_shapes || [],
@@ -79,12 +82,57 @@ function buildElements(payload) {
   return [...nodes, ...edges];
 }
 
+function buildPresetPositions(elements) {
+  const nodeElements = elements.filter((element) => !Object.prototype.hasOwnProperty.call(element.data, "source"));
+  const nodesSorted = [...nodeElements].sort((a, b) => {
+    const stageA = Number.isFinite(a.data.stage_index) ? a.data.stage_index : Number.MAX_SAFE_INTEGER;
+    const stageB = Number.isFinite(b.data.stage_index) ? b.data.stage_index : Number.MAX_SAFE_INTEGER;
+    if (stageA !== stageB) return stageA - stageB;
+    return (a.data.sequence_order || 0) - (b.data.sequence_order || 0);
+  });
+
+  const explicitStages = nodesSorted
+    .map((node) => node.data.stage_index)
+    .filter((stage) => Number.isFinite(stage) && stage > -2);
+  const minStage = explicitStages.length > 0 ? Math.min(...explicitStages) : 0;
+  const maxStage = explicitStages.length > 0 ? Math.max(...explicitStages) : 10;
+  let fallbackStage = maxStage - minStage + 2;
+  const stageCounts = new Map();
+  const positions = {};
+
+  for (const node of nodesSorted) {
+    let stage;
+    if (node.data.id === "__input__") {
+      stage = 0;
+    } else if (node.data.id === "__output__") {
+      stage = maxStage - minStage + 3;
+    } else if (Number.isFinite(node.data.stage_index)) {
+      stage = node.data.stage_index - minStage + 1;
+    } else {
+      stage = fallbackStage;
+      fallbackStage += 1;
+    }
+
+    const row = stageCounts.get(stage) || 0;
+    stageCounts.set(stage, row + 1);
+    positions[node.data.id] = {
+      x: 220 * stage,
+      y: 80 + row * 90,
+    };
+  }
+
+  return positions;
+}
+
 function renderNodeDetails(data) {
   const lines = [];
   lines.push(`Node: ${data.id}`);
   lines.push(`Module: ${data.module_name}`);
+  lines.push(`Target: ${data.op_target}`);
   lines.push(`Type: ${data.module_type}`);
   if (data.call_index) lines.push(`Invocation: #${data.call_index}`);
+  lines.push(`Stage index: ${data.stage_index}`);
+  lines.push(`Sequence order: ${data.sequence_order}`);
   lines.push(`Parameter count: ${Number(data.parameter_count || 0).toLocaleString()}`);
   lines.push("");
   lines.push("Input shapes:");
@@ -122,6 +170,7 @@ function renderEdgeDetails(data) {
 function renderGraph(payload) {
   const container = document.getElementById("graph");
   const elements = buildElements(payload);
+  const positions = buildPresetPositions(elements);
 
   if (cy) cy.destroy();
 
@@ -177,14 +226,7 @@ function renderGraph(payload) {
         },
       },
     ],
-    layout: {
-      name: "dagre",
-      rankDir: "LR",
-      nodeSep: 28,
-      rankSep: 85,
-      edgeSep: 10,
-      animate: false,
-    },
+    layout: { name: "preset", positions, animate: false },
     minZoom: 0.1,
     maxZoom: 2.5,
   });
@@ -222,6 +264,7 @@ form.addEventListener("submit", async (event) => {
     batch_size: Number(document.getElementById("batch-size").value),
     trust_remote_code: document.getElementById("trust-remote-code").checked,
     device: document.getElementById("device").value.trim(),
+    graph_mode: document.getElementById("graph-mode").value,
   };
 
   try {
@@ -241,6 +284,8 @@ form.addEventListener("submit", async (event) => {
       [
         `Model: ${result.model.id_or_path} (${result.model.class})`,
         `Device: ${result.model.device}`,
+        `Graph mode requested: ${result.graph_mode_requested}`,
+        `Graph mode used: ${result.graph_mode_used}`,
         `Executed unique modules: ${result.totals.executed_modules.toLocaleString()}`,
         `Executed calls: ${result.totals.executed_calls.toLocaleString()}`,
         `Total params: ${result.totals.parameters.toLocaleString()}`,
