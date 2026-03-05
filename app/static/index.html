@@ -81,6 +81,16 @@
             </select>
           </label>
 
+          <label>
+            Layer filter (optional)
+            <input
+              id="layer-filter"
+              name="layer_filter"
+              placeholder="e.g. 0 or 1,3 or 0-2"
+              value=""
+            />
+          </label>
+
           <button id="run-button" type="submit">Visualize</button>
           <button id="release-gpu-button" type="button" class="secondary-btn">
             Release GPU memory
@@ -99,6 +109,7 @@
           <span><i class="swatch input"></i>Input edge</span>
           <span><i class="swatch observed"></i>Observed module edge</span>
           <span><i class="swatch key"></i>Key-flow compressed edge</span>
+          <span><i class="swatch filtered"></i>Layer-filter compressed edge</span>
           <span><i class="swatch functional"></i>Functional/inferred edge</span>
           <span><i class="swatch terminal"></i>Output edge</span>
         </div>

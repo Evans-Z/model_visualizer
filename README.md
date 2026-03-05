@@ -53,7 +53,8 @@ Request example:
   "trust_remote_code": false,
   "device": "cuda:0",
   "graph_mode": "hybrid",
-  "operation_detail": "key"
+  "operation_detail": "key",
+  "layer_filter": "0-1"
 }
 ```
 
@@ -66,6 +67,8 @@ Response contains:
 - `totals.parameters`, `totals.trainable_parameters`.
 - `graph_mode_requested`, `graph_mode_used`.
 - `operation_detail_requested`, `operation_detail_used`.
+- `layer_filter_requested`, `layer_filter_used`.
+- `visible.nodes`, `visible.edges` (after filtering/simplification).
 
 `graph_mode` values:
 
@@ -77,6 +80,16 @@ Response contains:
 
 - `key`: keep only key components (attention/linear-related modules and key ops like matmul/softmax), compress other op chains.
 - `full`: keep full operation graph.
+
+`layer_filter` values:
+
+- empty / `all` / `*`: show all layers.
+- single layer: `0`
+- list: `0,3,7`
+- range: `0-2`
+
+When layer filtering is enabled, non-selected nodes are compressed away and
+their connectivity is represented by `layer_filtered` edges.
 
 In `hybrid` mode the backend retries operation tracing with multiple strategies
 (default FX, `transformers.utils.fx` compatibility tracer, a fallback tracer with
