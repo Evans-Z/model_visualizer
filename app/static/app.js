@@ -13,6 +13,13 @@ function setStatus(message) {
   statusOutput.textContent = message;
 }
 
+function clearGraph() {
+  if (cy) {
+    cy.destroy();
+    cy = null;
+  }
+}
+
 function summarizeShapes(shapeList, maxItems = 3) {
   if (!shapeList || shapeList.length === 0) return "[]";
   const shown = shapeList.slice(0, maxItems);
@@ -91,12 +98,12 @@ function buildPresetPositions(elements) {
     return (a.data.sequence_order || 0) - (b.data.sequence_order || 0);
   });
 
-  const explicitStages = nodesSorted
+  const stageValues = nodesSorted
     .map((node) => node.data.stage_index)
     .filter((stage) => Number.isFinite(stage) && stage > -2);
-  const minStage = explicitStages.length > 0 ? Math.min(...explicitStages) : 0;
-  const maxStage = explicitStages.length > 0 ? Math.max(...explicitStages) : 10;
-  let fallbackStage = maxStage - minStage + 2;
+  const uniqueStageValues = [...new Set(stageValues)].sort((a, b) => a - b);
+  const stageToRank = new Map(uniqueStageValues.map((stage, idx) => [stage, idx + 1]));
+  let fallbackStage = uniqueStageValues.length + 2;
   const stageCounts = new Map();
   const positions = {};
 
@@ -105,13 +112,13 @@ function buildPresetPositions(elements) {
     if (node.data.id === "__input__") {
       stage = 0;
     } else if (node.data.id === "__output__") {
-      stage = maxStage - minStage + 3;
+      stage = uniqueStageValues.length + 3;
     } else if (Number.isFinite(node.data.stage_index)) {
-      stage = node.data.stage_index - minStage + 1;
+      stage = stageToRank.get(node.data.stage_index) ?? fallbackStage;
     } else {
       stage = fallbackStage;
-      fallbackStage += 1;
     }
+    fallbackStage = Math.max(fallbackStage, stage + 1);
 
     const row = stageCounts.get(stage) || 0;
     stageCounts.set(stage, row + 1);
@@ -172,7 +179,7 @@ function renderGraph(payload) {
   const elements = buildElements(payload);
   const positions = buildPresetPositions(elements);
 
-  if (cy) cy.destroy();
+  clearGraph();
 
   cy = cytoscape({
     container,
@@ -254,6 +261,7 @@ async function releaseGpuMemory(showMessage = true) {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  clearGraph();
   setStatus("Tracing model execution...");
   nodeDetails.textContent = "Run visualization and click a node/edge for details.";
 
@@ -275,6 +283,7 @@ form.addEventListener("submit", async (event) => {
     });
     const result = await response.json();
     if (!response.ok) {
+      clearGraph();
       setStatus(`Error: ${result.detail || "Unknown failure"}`);
       return;
     }
@@ -294,6 +303,7 @@ form.addEventListener("submit", async (event) => {
       ].join("\n"),
     );
   } catch (error) {
+    clearGraph();
     setStatus(`Request failed: ${error}`);
   }
 });
