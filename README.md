@@ -71,6 +71,10 @@ Response contains:
 - `operations`: operation graph from Torch FX only (fails if model is not FX-traceable),
 - `hybrid`: try operation graph first, fallback to module graph.
 
+In `hybrid` mode the backend retries operation tracing with multiple strategies
+(default FX, `transformers.utils.fx` compatibility tracer, then a fallback tracer
+with autowrapped Python builtins such as `len`/`range`) before falling back.
+
 ### `POST /api/release-gpu`
 
 Best-effort GPU cache cleanup (`gc.collect()`, `torch.cuda.empty_cache()`, `torch.cuda.ipc_collect()`).

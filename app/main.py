@@ -12,9 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from torch.fx import symbolic_trace
+from torch.fx import GraphModule, Tracer, symbolic_trace
 from torch.fx.passes.shape_prop import ShapeProp
 from transformers import AutoModel, AutoTokenizer
+
+try:  # pragma: no cover - depends on transformers version
+    from transformers.utils.fx import symbolic_trace as hf_symbolic_trace
+except Exception:  # pragma: no cover - optional fallback
+    hf_symbolic_trace = None
 
 
 class VisualizeRequest(BaseModel):
@@ -160,6 +165,44 @@ def split_inputs_for_signature(
         else:
             kwargs[name] = inputs[name]
     return args, kwargs
+
+
+def build_fx_graph_with_retries(
+    model: torch.nn.Module,
+    input_names: list[str],
+) -> tuple[GraphModule, list[str]]:
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    try:
+        return symbolic_trace(model), warnings
+    except Exception as exc:
+        errors.append(f"default symbolic_trace failed: {exc}")
+
+    if hf_symbolic_trace is not None:
+        try:
+            traced = hf_symbolic_trace(
+                model,
+                input_names=input_names,
+            )
+            warnings.append("Using transformers.fx symbolic trace compatibility mode.")
+            return traced, warnings
+        except Exception as exc:
+            errors.append(f"transformers.fx symbolic_trace failed: {exc}")
+
+    # Fallback tracer: autowrap common Python builtins that appear in
+    # model forward logic (for example len/range in cache handling).
+    try:
+        tracer = Tracer(
+            autowrap_functions=(len, range, int, float, bool, max, min, abs),
+        )
+        graph = tracer.trace(model)
+        warnings.append("Using fallback FX tracer with autowrapped builtins.")
+        return GraphModule(model, graph), warnings
+    except Exception as exc:
+        errors.append(f"fallback tracer failed: {exc}")
+
+    raise RuntimeError(" | ".join(errors))
 
 
 def build_fallback_inputs(
@@ -516,7 +559,8 @@ def trace_operations_execution(
     signature: inspect.Signature,
 ) -> tuple[dict[str, Any], list[str]]:
     warnings: list[str] = []
-    traced = symbolic_trace(model)
+    traced, trace_warnings = build_fx_graph_with_retries(model, list(inputs.keys()))
+    warnings.extend(trace_warnings)
 
     args, kwargs = split_inputs_for_signature(signature, inputs)
     try:
