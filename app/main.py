@@ -97,12 +97,32 @@ def _accepts_kwargs(signature: inspect.Signature) -> bool:
 
 def filter_for_forward(
     signature: inspect.Signature,
-    candidate_inputs: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
+    candidate_inputs: dict[str, Any],
+) -> dict[str, Any]:
     if _accepts_kwargs(signature):
         return candidate_inputs
     valid = set(signature.parameters.keys())
     return {key: value for key, value in candidate_inputs.items() if key in valid}
+
+
+def build_trace_control_kwargs(signature: inspect.Signature) -> dict[str, bool]:
+    candidate: dict[str, bool] = {
+        "use_cache": False,
+        "return_dict": False,
+        "output_attentions": False,
+        "output_hidden_states": False,
+    }
+    return filter_for_forward(signature, candidate)
+
+
+def build_concrete_control_kwargs(signature: inspect.Signature) -> dict[str, bool]:
+    explicit_names = {
+        name
+        for name, param in signature.parameters.items()
+        if param.kind != inspect.Parameter.VAR_KEYWORD
+    }
+    control_kwargs = build_trace_control_kwargs(signature)
+    return {key: value for key, value in control_kwargs.items() if key in explicit_names}
 
 
 def normalize_device(device_value: str) -> tuple[torch.device, str]:
@@ -168,10 +188,10 @@ def node_shape_from_fx_meta(meta: Any) -> str:
 
 
 def split_inputs_for_signature(
-    signature: inspect.Signature, inputs: dict[str, torch.Tensor]
-) -> tuple[list[torch.Tensor], dict[str, torch.Tensor]]:
-    args: list[torch.Tensor] = []
-    kwargs: dict[str, torch.Tensor] = {}
+    signature: inspect.Signature, inputs: dict[str, Any]
+) -> tuple[list[Any], dict[str, Any]]:
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
     for name, param in signature.parameters.items():
         if name == "self" or name not in inputs:
             continue
@@ -185,17 +205,33 @@ def split_inputs_for_signature(
     return args, kwargs
 
 
+def normalize_trace_output(output: Any) -> Any:
+    if isinstance(output, torch.Tensor):
+        return output
+    if hasattr(output, "last_hidden_state") and isinstance(output.last_hidden_state, torch.Tensor):
+        return output.last_hidden_state
+    tensors = list(iter_tensors(output))
+    if not tensors:
+        raise RuntimeError("Could not extract tensor output for operation tracing")
+    if len(tensors) == 1:
+        return tensors[0]
+    return tuple(tensors[:8])
+
+
 def build_fx_graph_with_retries(
     model: torch.nn.Module,
     input_names: list[str],
-    args: list[torch.Tensor],
-    kwargs: dict[str, torch.Tensor],
-) -> tuple[GraphModule, list[str], str, list[torch.Tensor]]:
+    args: list[Any],
+    kwargs: dict[str, Any],
+    runtime_control_kwargs: dict[str, bool],
+    concrete_control_kwargs: dict[str, bool],
+) -> tuple[GraphModule, list[str], str, list[Any]]:
     warnings: list[str] = []
     errors: list[str] = []
 
     try:
-        return symbolic_trace(model), warnings, "symbolic", []
+        traced = symbolic_trace(model, concrete_args=concrete_control_kwargs)
+        return traced, warnings, "symbolic", []
     except Exception as exc:
         errors.append(f"default symbolic_trace failed: {exc}")
 
@@ -216,7 +252,7 @@ def build_fx_graph_with_retries(
         tracer = Tracer(
             autowrap_functions=(len, range, int, float, bool, max, min, abs),
         )
-        graph = tracer.trace(model)
+        graph = tracer.trace(model, concrete_args=concrete_control_kwargs)
         warnings.append("Using fallback FX tracer with autowrapped builtins.")
         return GraphModule(model, graph), warnings, "fallback_tracer", []
     except Exception as exc:
@@ -235,15 +271,28 @@ def build_fx_graph_with_retries(
                 call_kwargs = {
                     name: kwarg_values[index] for index, name in enumerate(kwarg_names)
                 }
-                return model(*call_args, **call_kwargs)
+                merged_kwargs = {**call_kwargs, **runtime_control_kwargs}
+                return normalize_trace_output(model(*call_args, **merged_kwargs))
 
             try:
-                traced = make_fx(forward_for_make_fx, tracing_mode="real")(*flat_inputs)
+                real_kwargs: dict[str, Any] = {"tracing_mode": "real"}
+                real_params = inspect.signature(make_fx).parameters
+                if "_allow_non_fake_inputs" in real_params:
+                    real_kwargs["_allow_non_fake_inputs"] = True
+                elif "allow_non_fake_inputs" in real_params:
+                    real_kwargs["allow_non_fake_inputs"] = True
+                traced = make_fx(forward_for_make_fx, **real_kwargs)(*flat_inputs)
                 warnings.append("Using make_fx runtime operator tracing fallback (real mode).")
                 return traced, warnings, "make_fx_real", flat_inputs
             except Exception as real_exc:
                 errors.append(f"make_fx runtime tracing failed (real): {real_exc}")
-                traced = make_fx(forward_for_make_fx, tracing_mode="symbolic")(*flat_inputs)
+                symbolic_kwargs: dict[str, Any] = {"tracing_mode": "symbolic"}
+                symbolic_params = inspect.signature(make_fx).parameters
+                if "_allow_non_fake_inputs" in symbolic_params:
+                    symbolic_kwargs["_allow_non_fake_inputs"] = True
+                elif "allow_non_fake_inputs" in symbolic_params:
+                    symbolic_kwargs["allow_non_fake_inputs"] = True
+                traced = make_fx(forward_for_make_fx, **symbolic_kwargs)(*flat_inputs)
                 warnings.append(
                     "Using make_fx runtime operator tracing fallback (symbolic mode)."
                 )
@@ -255,7 +304,22 @@ def build_fx_graph_with_retries(
     # control paths that are hard for FX symbolic tracing.
     if torch_export is not None:
         try:
-            exported = torch_export(model, tuple(args), kwargs=kwargs)
+            class ExportTraceWrapper(torch.nn.Module):
+                def __init__(self, wrapped_model: torch.nn.Module, forced_kwargs: dict[str, bool]):
+                    super().__init__()
+                    self.wrapped_model = wrapped_model
+                    self.forced_kwargs = forced_kwargs
+
+                def forward(self, *f_args, **f_kwargs):
+                    merged_kwargs = {**f_kwargs, **self.forced_kwargs}
+                    return normalize_trace_output(self.wrapped_model(*f_args, **merged_kwargs))
+
+            export_wrapper = ExportTraceWrapper(model, runtime_control_kwargs)
+            export_kwargs: dict[str, Any] = {"kwargs": kwargs}
+            export_params = inspect.signature(torch_export).parameters
+            if "strict" in export_params:
+                export_kwargs["strict"] = False
+            exported = torch_export(export_wrapper, tuple(args), **export_kwargs)
             warnings.append("Using torch.export fallback operation graph.")
             return exported.graph_module, warnings, "export", [*args, *kwargs.values()]
         except Exception as exc:
@@ -614,16 +678,20 @@ def trace_model_execution(
 
 def trace_operations_execution(
     model: torch.nn.Module,
-    inputs: dict[str, torch.Tensor],
+    inputs: dict[str, Any],
     signature: inspect.Signature,
 ) -> tuple[dict[str, Any], list[str]]:
     warnings: list[str] = []
+    runtime_control_kwargs = build_trace_control_kwargs(signature)
+    concrete_control_kwargs = build_concrete_control_kwargs(signature)
     args, kwargs = split_inputs_for_signature(signature, inputs)
     traced, trace_warnings, trace_kind, flat_inputs = build_fx_graph_with_retries(
         model,
         list(inputs.keys()),
         args,
         kwargs,
+        runtime_control_kwargs=runtime_control_kwargs,
+        concrete_control_kwargs=concrete_control_kwargs,
     )
     warnings.extend(trace_warnings)
     try:
@@ -680,11 +748,12 @@ def trace_operations_execution(
             input_tensor = inputs.get(fx_node.name)
             if input_tensor is None and placeholder_index < len(flat_inputs):
                 input_tensor = flat_inputs[placeholder_index]
-            output_shape = (
-                format_shape(list(input_tensor.shape))
-                if input_tensor is not None
-                else node_shape_from_fx_meta(fx_node.meta.get("tensor_meta"))
-            )
+            if isinstance(input_tensor, torch.Tensor):
+                output_shape = format_shape(list(input_tensor.shape))
+            elif input_tensor is not None:
+                output_shape = format_shape(shape_of(input_tensor))
+            else:
+                output_shape = node_shape_from_fx_meta(fx_node.meta.get("tensor_meta"))
             nodes.append(
                 {
                     "id": node_id,

@@ -75,6 +75,8 @@ In `hybrid` mode the backend retries operation tracing with multiple strategies
 (default FX, `transformers.utils.fx` compatibility tracer, a fallback tracer with
 autowrapped Python builtins such as `len`/`range`, and runtime operator tracing
 via `make_fx` in `real`/`symbolic` modes, then `torch.export`) before falling back.
+For tracing stability on causal LLMs, operation tracing also forces
+`use_cache=False` / `return_dict=False` when the model forward accepts these flags.
 
 ### `POST /api/release-gpu`
 
