@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from torch.fx import GraphModule, Tracer, symbolic_trace
+from torch.fx import GraphModule, Tracer, symbolic_trace, wrap
 from torch.fx.passes.shape_prop import ShapeProp
 from transformers import AutoModel, AutoTokenizer
 
@@ -25,6 +25,19 @@ try:  # pragma: no cover - depends on torch version
     from torch.fx.experimental.proxy_tensor import make_fx
 except Exception:  # pragma: no cover - optional fallback
     make_fx = None
+
+try:  # pragma: no cover - depends on torch version
+    from torch.export import export as torch_export
+except Exception:  # pragma: no cover - optional fallback
+    torch_export = None
+
+# Register common Python builtins so symbolic FX can capture these calls
+# when model forward implementations reference them directly.
+for _fx_builtin in ("len", "range", "int", "float", "bool", "max", "min", "abs"):
+    try:  # pragma: no cover - torch internals vary by version
+        wrap(_fx_builtin)
+    except Exception:
+        pass
 
 
 class VisualizeRequest(BaseModel):
@@ -137,8 +150,8 @@ def infer_stage_index(name: str, sequence_order: int) -> int:
         match = re.search(pattern, name)
         if match:
             return int(match.group(1))
-    # Keep non-layered nodes deterministic but after indexed layers.
-    return 10_000 + sequence_order
+    # Keep non-layered nodes deterministic without exploding layout span.
+    return sequence_order
 
 
 def node_shape_from_fx_meta(meta: Any) -> str:
@@ -209,7 +222,7 @@ def build_fx_graph_with_retries(
     except Exception as exc:
         errors.append(f"fallback tracer failed: {exc}")
 
-    # Final fallback: runtime operator tracing via make_fx.
+    # Runtime operator tracing via make_fx.
     if make_fx is not None:
         try:
             pos_count = len(args)
@@ -224,11 +237,29 @@ def build_fx_graph_with_retries(
                 }
                 return model(*call_args, **call_kwargs)
 
-            traced = make_fx(forward_for_make_fx, tracing_mode="real")(*flat_inputs)
-            warnings.append("Using make_fx runtime operator tracing fallback.")
-            return traced, warnings, "make_fx", flat_inputs
+            try:
+                traced = make_fx(forward_for_make_fx, tracing_mode="real")(*flat_inputs)
+                warnings.append("Using make_fx runtime operator tracing fallback (real mode).")
+                return traced, warnings, "make_fx_real", flat_inputs
+            except Exception as real_exc:
+                errors.append(f"make_fx runtime tracing failed (real): {real_exc}")
+                traced = make_fx(forward_for_make_fx, tracing_mode="symbolic")(*flat_inputs)
+                warnings.append(
+                    "Using make_fx runtime operator tracing fallback (symbolic mode)."
+                )
+                return traced, warnings, "make_fx_symbolic", flat_inputs
         except Exception as exc:
-            errors.append(f"make_fx runtime tracing failed: {exc}")
+            errors.append(f"make_fx runtime tracing failed (symbolic): {exc}")
+
+    # Export fallback (dynamo/export graph) for models with data-dependent
+    # control paths that are hard for FX symbolic tracing.
+    if torch_export is not None:
+        try:
+            exported = torch_export(model, tuple(args), kwargs=kwargs)
+            warnings.append("Using torch.export fallback operation graph.")
+            return exported.graph_module, warnings, "export", [*args, *kwargs.values()]
+        except Exception as exc:
+            errors.append(f"torch.export fallback failed: {exc}")
 
     raise RuntimeError(" | ".join(errors))
 
@@ -596,8 +627,10 @@ def trace_operations_execution(
     )
     warnings.extend(trace_warnings)
     try:
-        if trace_kind == "make_fx":
+        if trace_kind in {"make_fx_real", "make_fx_symbolic"}:
             ShapeProp(traced).propagate(*flat_inputs)
+        elif trace_kind == "export":
+            ShapeProp(traced).propagate(*args, **kwargs)
         else:
             ShapeProp(traced).propagate(*args, **kwargs)
     except Exception as exc:
