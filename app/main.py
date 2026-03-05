@@ -58,6 +58,10 @@ class VisualizeRequest(BaseModel):
         default="hybrid",
         description="module, operations, or hybrid (prefer operations fallback to module)",
     )
+    operation_detail: str = Field(
+        default="key",
+        description="operations graph detail level: key or full",
+    )
 
 def iter_tensors(value: Any):
     if isinstance(value, torch.Tensor):
@@ -216,6 +220,136 @@ def normalize_trace_output(output: Any) -> Any:
     if len(tensors) == 1:
         return tensors[0]
     return tuple(tensors[:8])
+
+
+def is_key_operation_node(node: dict[str, Any]) -> bool:
+    node_id = node.get("id", "")
+    if node_id in {"__input__", "__output__", "__functional__"}:
+        return True
+
+    module_type = str(node.get("module_type", "")).lower()
+    module_name = str(node.get("module_name", "")).lower()
+    op_target = str(node.get("op_target", "")).lower()
+
+    if module_type == "inputarg":
+        return True
+
+    key_module_keywords = (
+        "attention",
+        "attn",
+        "linear",
+        "embedding",
+        "embed",
+        "norm",
+        "mlp",
+        "proj",
+        "gate",
+        "lmhead",
+    )
+    if any(keyword in module_type for keyword in key_module_keywords):
+        return True
+    if any(keyword in module_name for keyword in key_module_keywords):
+        return True
+
+    key_operation_keywords = (
+        "matmul",
+        "mm",
+        "bmm",
+        "addmm",
+        "softmax",
+        "scaled_dot_product_attention",
+        "einsum",
+    )
+    if any(keyword in op_target for keyword in key_operation_keywords):
+        return True
+
+    return False
+
+
+def simplify_operation_graph(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    node_map = {node["id"]: node for node in nodes}
+    keep_ids = {node["id"] for node in nodes if is_key_operation_node(node)}
+    keep_ids.update({"__input__", "__output__"})
+
+    adjacency: dict[str, list[dict[str, Any]]] = {}
+    for edge in edges:
+        adjacency.setdefault(edge["source"], []).append(edge)
+
+    merged_edges: dict[tuple[str, str, str], set[str]] = {}
+
+    def merge_edge(source: str, target: str, kind: str, shapes: list[str] | None):
+        if source == target:
+            return
+        key = (source, target, kind)
+        if key not in merged_edges:
+            merged_edges[key] = set()
+        if shapes:
+            merged_edges[key].update(shapes)
+        else:
+            merged_edges[key].add("unknown")
+
+    for source in keep_ids:
+        if source not in adjacency:
+            continue
+        queue: list[tuple[str, list[str]]] = []
+        for edge in adjacency[source]:
+            if edge["target"] in keep_ids:
+                merge_edge(
+                    source=source,
+                    target=edge["target"],
+                    kind=edge.get("kind", "observed"),
+                    shapes=edge.get("shapes", []),
+                )
+                continue
+            queue.append((edge["target"], edge.get("shapes", [])))
+
+        visited: set[str] = set()
+        while queue:
+            current, carried_shapes = queue.pop(0)
+            if current in keep_ids:
+                if current != source:
+                    merge_edge(source, current, "compressed_key", carried_shapes)
+                continue
+            if current in visited:
+                continue
+            visited.add(current)
+            for next_edge in adjacency.get(current, []):
+                next_shapes = next_edge.get("shapes", []) or carried_shapes
+                queue.append((next_edge["target"], next_shapes))
+
+    filtered_edges: list[dict[str, Any]] = []
+    for (source, target, kind), shapes in sorted(merged_edges.items()):
+        filtered_edges.append(
+            {
+                "source": source,
+                "target": target,
+                "kind": kind,
+                "shapes": sorted(shapes),
+                "count": len(shapes),
+            }
+        )
+
+    connected_ids = {"__input__", "__output__"}
+    for edge in filtered_edges:
+        connected_ids.add(edge["source"])
+        connected_ids.add(edge["target"])
+
+    filtered_nodes = [
+        node
+        for node in sorted(nodes, key=lambda item: item.get("sequence_order", 0))
+        if node["id"] in keep_ids and node["id"] in connected_ids
+    ]
+
+    stats = {
+        "kept_nodes": len(filtered_nodes),
+        "kept_edges": len(filtered_edges),
+        "removed_nodes": len(nodes) - len(filtered_nodes),
+        "removed_edges": len(edges) - len(filtered_edges),
+    }
+    return filtered_nodes, filtered_edges, stats
 
 
 def build_fx_graph_with_retries(
@@ -680,6 +814,7 @@ def trace_operations_execution(
     model: torch.nn.Module,
     inputs: dict[str, Any],
     signature: inspect.Signature,
+    operation_detail: str,
 ) -> tuple[dict[str, Any], list[str]]:
     warnings: list[str] = []
     runtime_control_kwargs = build_trace_control_kwargs(signature)
@@ -881,6 +1016,14 @@ def trace_operations_execution(
             }
         )
 
+    if operation_detail == "key":
+        nodes, edges, simplify_stats = simplify_operation_graph(nodes, edges)
+        warnings.append(
+            "Key-operation filter applied: "
+            f"removed {simplify_stats['removed_nodes']} nodes and "
+            f"{simplify_stats['removed_edges']} edges."
+        )
+
     return (
         {
             "nodes": nodes,
@@ -974,6 +1117,13 @@ def visualize(request: VisualizeRequest):
                 status_code=400,
                 detail="graph_mode must be 'module', 'operations', or 'hybrid'",
             )
+        operation_detail_requested = request.operation_detail.lower().strip()
+        if operation_detail_requested not in {"key", "full"}:
+            raise HTTPException(
+                status_code=400,
+                detail="operation_detail must be 'key' or 'full'",
+            )
+        operation_detail_used = operation_detail_requested
 
         if graph_mode_requested in {"operations", "hybrid"}:
             try:
@@ -981,6 +1131,7 @@ def visualize(request: VisualizeRequest):
                     model=model,
                     inputs=inputs,
                     signature=signature,
+                    operation_detail=operation_detail_requested,
                 )
                 warnings.extend(op_warnings)
                 graph_mode_used = "operations"
@@ -996,6 +1147,7 @@ def visualize(request: VisualizeRequest):
             try:
                 graph = trace_model_execution(model=model, inputs=inputs)
                 graph_mode_used = "module"
+                operation_detail_used = "module_view"
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"Model trace failed: {exc}") from exc
 
@@ -1007,6 +1159,8 @@ def visualize(request: VisualizeRequest):
             },
             "graph_mode_requested": graph_mode_requested,
             "graph_mode_used": graph_mode_used,
+            "operation_detail_requested": operation_detail_requested,
+            "operation_detail_used": operation_detail_used,
             "input_shapes": {key: list(value.shape) for key, value in inputs.items()},
             "warnings": warnings,
             **graph,

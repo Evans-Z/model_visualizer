@@ -52,7 +52,8 @@ Request example:
   "seq_len": 16,
   "trust_remote_code": false,
   "device": "cuda:0",
-  "graph_mode": "hybrid"
+  "graph_mode": "hybrid",
+  "operation_detail": "key"
 }
 ```
 
@@ -64,12 +65,18 @@ Response contains:
 - `totals.executed_modules`, `totals.executed_calls`,
 - `totals.parameters`, `totals.trainable_parameters`.
 - `graph_mode_requested`, `graph_mode_used`.
+- `operation_detail_requested`, `operation_detail_used`.
 
 `graph_mode` values:
 
 - `module`: module invocation graph from runtime hooks,
 - `operations`: operation graph from Torch FX only (fails if model is not FX-traceable),
 - `hybrid`: try operation graph first, fallback to module graph.
+
+`operation_detail` values:
+
+- `key`: keep only key components (attention/linear-related modules and key ops like matmul/softmax), compress other op chains.
+- `full`: keep full operation graph.
 
 In `hybrid` mode the backend retries operation tracing with multiple strategies
 (default FX, `transformers.utils.fx` compatibility tracer, a fallback tracer with

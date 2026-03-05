@@ -89,6 +89,10 @@ main {
   background: #94a3b8;
 }
 
+.swatch.key {
+  background: #fbbf24;
+}
+
 .swatch.functional {
   background: #fb923c;
 }
