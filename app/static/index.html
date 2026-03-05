@@ -64,6 +64,15 @@
             </label>
           </div>
 
+          <label>
+            Graph mode
+            <select id="graph-mode" name="graph_mode">
+              <option value="hybrid" selected>hybrid (prefer operations)</option>
+              <option value="operations">operations only</option>
+              <option value="module">module only</option>
+            </select>
+          </label>
+
           <button id="run-button" type="submit">Visualize</button>
           <button id="release-gpu-button" type="button" class="secondary-btn">
             Release GPU memory
