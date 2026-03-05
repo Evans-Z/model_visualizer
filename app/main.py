@@ -62,6 +62,10 @@ class VisualizeRequest(BaseModel):
         default="key",
         description="operations graph detail level: key or full",
     )
+    layer_filter: str = Field(
+        default="",
+        description="Optional layer selection, e.g. '0', '1,3', '0-2'",
+    )
 
 def iter_tensors(value: Any):
     if isinstance(value, torch.Tensor):
@@ -319,6 +323,161 @@ def simplify_operation_graph(
             for next_edge in adjacency.get(current, []):
                 next_shapes = next_edge.get("shapes", []) or carried_shapes
                 queue.append((next_edge["target"], next_shapes))
+
+    filtered_edges: list[dict[str, Any]] = []
+    for (source, target, kind), shapes in sorted(merged_edges.items()):
+        filtered_edges.append(
+            {
+                "source": source,
+                "target": target,
+                "kind": kind,
+                "shapes": sorted(shapes),
+                "count": len(shapes),
+            }
+        )
+
+    connected_ids = {"__input__", "__output__"}
+    for edge in filtered_edges:
+        connected_ids.add(edge["source"])
+        connected_ids.add(edge["target"])
+
+    filtered_nodes = [
+        node
+        for node in sorted(nodes, key=lambda item: item.get("sequence_order", 0))
+        if node["id"] in keep_ids and node["id"] in connected_ids
+    ]
+
+    stats = {
+        "kept_nodes": len(filtered_nodes),
+        "kept_edges": len(filtered_edges),
+        "removed_nodes": len(nodes) - len(filtered_nodes),
+        "removed_edges": len(edges) - len(filtered_edges),
+    }
+    return filtered_nodes, filtered_edges, stats
+
+
+def extract_layer_index_from_text(text: str) -> int | None:
+    patterns = [
+        r"(?:^|\.)(?:layers?|blocks?|h)\.(\d+)(?:\.|$)",
+        r"(?:^|\.)(?:encoder|decoder)\.layer\.(\d+)(?:\.|$)",
+        r"(?:^|\.)(?:encoder|decoder)\.block\.(\d+)(?:\.|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def parse_layer_filter(raw_filter: str) -> set[int] | None:
+    value = raw_filter.strip()
+    if not value or value.lower() in {"all", "*"}:
+        return None
+
+    selected: set[int] = set()
+    for token in value.split(","):
+        piece = token.strip()
+        if not piece:
+            continue
+        if "-" in piece:
+            left, right = piece.split("-", 1)
+            if not left.strip().isdigit() or not right.strip().isdigit():
+                raise ValueError(
+                    "Invalid layer_filter range. Use formats like '0-3' or '1,3,5'."
+                )
+            start = int(left.strip())
+            end = int(right.strip())
+            if start > end:
+                start, end = end, start
+            selected.update(range(start, end + 1))
+            continue
+
+        if not piece.isdigit():
+            raise ValueError(
+                "Invalid layer_filter token. Use formats like '0', '1,3', or '0-2'."
+            )
+        selected.add(int(piece))
+
+    if not selected:
+        raise ValueError("layer_filter did not contain any valid layer index")
+    return selected
+
+
+def apply_layer_filter_to_graph(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    selected_layers: set[int] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    if selected_layers is None:
+        return nodes, edges, {
+            "kept_nodes": len(nodes),
+            "kept_edges": len(edges),
+            "removed_nodes": 0,
+            "removed_edges": 0,
+        }
+
+    node_map = {node["id"]: node for node in nodes}
+    adjacency: dict[str, list[dict[str, Any]]] = {}
+    for edge in edges:
+        adjacency.setdefault(edge["source"], []).append(edge)
+
+    special_ids = {"__input__", "__output__", "__functional__"}
+    keep_ids: set[str] = set()
+    for node in nodes:
+        node_id = node["id"]
+        if node_id in special_ids:
+            keep_ids.add(node_id)
+            continue
+        layer_index = node.get("layer_index")
+        if layer_index is None:
+            for candidate in (
+                str(node.get("module_name", "")),
+                str(node.get("op_target", "")),
+                str(node.get("id", "")),
+            ):
+                layer_index = extract_layer_index_from_text(candidate)
+                if layer_index is not None:
+                    break
+            node["layer_index"] = layer_index
+        if layer_index in selected_layers:
+            keep_ids.add(node_id)
+
+    merged_edges: dict[tuple[str, str, str], set[str]] = {}
+
+    def merge_edge(source: str, target: str, kind: str, shapes: list[str] | None):
+        if source == target:
+            return
+        key = (source, target, kind)
+        if key not in merged_edges:
+            merged_edges[key] = set()
+        merged_edges[key].update(shapes or ["unknown"])
+
+    for source in keep_ids:
+        if source not in adjacency:
+            continue
+        queue: list[tuple[str, list[str]]] = []
+        for edge in adjacency[source]:
+            if edge["target"] in keep_ids:
+                merge_edge(
+                    source,
+                    edge["target"],
+                    edge.get("kind", "observed"),
+                    edge.get("shapes", []),
+                )
+                continue
+            queue.append((edge["target"], edge.get("shapes", [])))
+
+        visited: set[str] = set()
+        while queue:
+            current, carried_shapes = queue.pop(0)
+            if current in keep_ids:
+                merge_edge(source, current, "layer_filtered", carried_shapes)
+                continue
+            if current in visited:
+                continue
+            visited.add(current)
+            for next_edge in adjacency.get(current, []):
+                queue.append((next_edge["target"], next_edge.get("shapes", []) or carried_shapes))
 
     filtered_edges: list[dict[str, Any]] = []
     for (source, target, kind), shapes in sorted(merged_edges.items()):
@@ -662,6 +821,7 @@ def trace_model_execution(
                     "label": f"{module_name}#{current_call}\n({module_type})",
                     "module_name": module_name,
                     "op_target": module_name,
+                    "layer_index": extract_layer_index_from_text(module_name),
                     "call_index": current_call,
                     "module_type": module_type,
                     "depth": module_name.count(".") + 1,
@@ -744,6 +904,7 @@ def trace_model_execution(
             "call_count": 1,
             "sequence_order": -2,
             "stage_index": -2,
+            "layer_index": None,
             "input_shapes": [],
             "output_shapes": [format_shape(shape_of(inputs))],
             "parameter_count": 0,
@@ -761,6 +922,7 @@ def trace_model_execution(
                 "call_count": 1,
                 "sequence_order": -1,
                 "stage_index": -1,
+                "layer_index": None,
                 "input_shapes": [],
                 "output_shapes": [],
                 "parameter_count": 0,
@@ -779,6 +941,7 @@ def trace_model_execution(
             "call_count": 1,
             "sequence_order": sequence_order + 1,
             "stage_index": infer_stage_index("output", sequence_order + 1),
+            "layer_index": None,
             "input_shapes": [],
             "output_shapes": [],
             "parameter_count": 0,
@@ -871,6 +1034,7 @@ def trace_operations_execution(
         edges_map[key].add(shape)
 
     node_id_by_name: dict[str, str] = {}
+    node_layer_by_name: dict[str, int | None] = {}
     output_sources: list[str] = []
     executed_module_names: set[str] = set()
     sequence_order = 0
@@ -895,6 +1059,7 @@ def trace_operations_execution(
                     "label": fx_node.name,
                     "module_name": fx_node.name,
                     "op_target": fx_node.name,
+                    "layer_index": extract_layer_index_from_text(fx_node.name),
                     "call_index": 1,
                     "module_type": "InputArg",
                     "depth": 1,
@@ -908,6 +1073,7 @@ def trace_operations_execution(
                 }
             )
             add_edge("__input__", node_id, output_shape, "input")
+            node_layer_by_name[fx_node.name] = extract_layer_index_from_text(fx_node.name)
             sequence_order += 1
             placeholder_index += 1
             continue
@@ -924,12 +1090,14 @@ def trace_operations_execution(
         module_type = fx_node.op
         op_target = str(fx_node.target)
         module_name = str(fx_node.target)
+        layer_index = extract_layer_index_from_text(module_name)
 
         if fx_node.op == "call_module":
             submodule = traced.get_submodule(str(fx_node.target))
             module_type = submodule.__class__.__name__
             module_name = str(fx_node.target)
             op_target = module_name
+            layer_index = extract_layer_index_from_text(module_name)
             executed_module_names.add(module_name)
             for param_name, param in submodule.named_parameters(recurse=False):
                 parameter_shapes.append(
@@ -941,14 +1109,26 @@ def trace_operations_execution(
             module_type = "FunctionOp"
             op_target = target_name
             module_name = fx_node.name
+            layer_index = extract_layer_index_from_text(fx_node.name)
         elif fx_node.op == "call_method":
             module_type = "MethodOp"
             op_target = str(fx_node.target)
             module_name = fx_node.name
+            layer_index = extract_layer_index_from_text(fx_node.name)
         elif fx_node.op == "get_attr":
             module_type = "GetAttr"
             op_target = str(fx_node.target)
             module_name = str(fx_node.target)
+            layer_index = extract_layer_index_from_text(module_name)
+
+        if layer_index is None:
+            source_layers = {
+                node_layer_by_name.get(source_node.name)
+                for source_node in fx_node.all_input_nodes
+                if node_layer_by_name.get(source_node.name) is not None
+            }
+            if len(source_layers) == 1:
+                layer_index = next(iter(source_layers))
 
         output_shape = node_shape_from_fx_meta(fx_node.meta.get("tensor_meta"))
         nodes.append(
@@ -957,6 +1137,7 @@ def trace_operations_execution(
                 "label": f"{fx_node.name}\n({module_type})",
                 "module_name": module_name,
                 "op_target": op_target,
+                "layer_index": layer_index,
                 "call_index": 1,
                 "module_type": module_type,
                 "depth": module_name.count(".") + 1,
@@ -969,6 +1150,7 @@ def trace_operations_execution(
                 "parameter_shapes": parameter_shapes,
             }
         )
+        node_layer_by_name[fx_node.name] = layer_index
 
         for source_node in fx_node.all_input_nodes:
             source_id = node_id_by_name.get(source_node.name)
@@ -986,6 +1168,7 @@ def trace_operations_execution(
             "label": "Output",
             "module_name": "__output__",
             "op_target": "__output__",
+            "layer_index": None,
             "call_index": 1,
             "module_type": "Output",
             "depth": 0,
@@ -1124,6 +1307,14 @@ def visualize(request: VisualizeRequest):
                 detail="operation_detail must be 'key' or 'full'",
             )
         operation_detail_used = operation_detail_requested
+        layer_filter_requested = request.layer_filter.strip()
+        try:
+            selected_layers = parse_layer_filter(layer_filter_requested)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        layer_filter_used = (
+            "all" if selected_layers is None else ",".join(str(item) for item in sorted(selected_layers))
+        )
 
         if graph_mode_requested in {"operations", "hybrid"}:
             try:
@@ -1151,6 +1342,22 @@ def visualize(request: VisualizeRequest):
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"Model trace failed: {exc}") from exc
 
+        graph["nodes"], graph["edges"], layer_stats = apply_layer_filter_to_graph(
+            graph["nodes"],
+            graph["edges"],
+            selected_layers,
+        )
+        graph["visible"] = {
+            "nodes": len(graph["nodes"]),
+            "edges": len(graph["edges"]),
+        }
+        if selected_layers is not None:
+            warnings.append(
+                "Layer filter applied: "
+                f"kept layers {layer_filter_used}; removed "
+                f"{layer_stats['removed_nodes']} nodes and {layer_stats['removed_edges']} edges."
+            )
+
         return {
             "model": {
                 "id_or_path": request.model_id_or_path,
@@ -1161,6 +1368,8 @@ def visualize(request: VisualizeRequest):
             "graph_mode_used": graph_mode_used,
             "operation_detail_requested": operation_detail_requested,
             "operation_detail_used": operation_detail_used,
+            "layer_filter_requested": layer_filter_requested,
+            "layer_filter_used": layer_filter_used,
             "input_shapes": {key: list(value.shape) for key, value in inputs.items()},
             "warnings": warnings,
             **graph,

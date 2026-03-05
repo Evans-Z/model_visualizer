@@ -93,6 +93,10 @@ main {
   background: #fbbf24;
 }
 
+.swatch.filtered {
+  background: #f43f5e;
+}
+
 .swatch.functional {
   background: #fb923c;
 }

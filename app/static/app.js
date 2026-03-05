@@ -240,6 +240,14 @@ function renderGraph(payload) {
           "line-style": "dashed",
         },
       },
+      {
+        selector: "edge.layer_filtered",
+        style: {
+          "line-color": "#f43f5e",
+          "target-arrow-color": "#f43f5e",
+          "line-style": "dotted",
+        },
+      },
     ],
     layout: { name: "preset", positions, animate: false },
     minZoom: 0.1,
@@ -282,6 +290,7 @@ form.addEventListener("submit", async (event) => {
     device: document.getElementById("device").value.trim(),
     graph_mode: document.getElementById("graph-mode").value,
     operation_detail: document.getElementById("operation-detail").value,
+    layer_filter: document.getElementById("layer-filter").value.trim(),
   };
 
   try {
@@ -306,6 +315,10 @@ form.addEventListener("submit", async (event) => {
         `Graph mode used: ${result.graph_mode_used}`,
         `Operation detail requested: ${result.operation_detail_requested}`,
         `Operation detail used: ${result.operation_detail_used}`,
+        `Layer filter requested: ${result.layer_filter_requested || "(all)"}`,
+        `Layer filter used: ${result.layer_filter_used}`,
+        `Visible nodes: ${result.visible.nodes.toLocaleString()}`,
+        `Visible edges: ${result.visible.edges.toLocaleString()}`,
         `Executed unique modules: ${result.totals.executed_modules.toLocaleString()}`,
         `Executed calls: ${result.totals.executed_calls.toLocaleString()}`,
         `Total params: ${result.totals.parameters.toLocaleString()}`,
